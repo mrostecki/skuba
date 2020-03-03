@@ -34,9 +34,7 @@ import (
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
-	"sigs.k8s.io/yaml"
 
-	"github.com/SUSE/skuba/internal/pkg/skuba/kubeadm"
 	"github.com/SUSE/skuba/internal/pkg/skuba/kubernetes"
 )
 
@@ -105,30 +103,14 @@ func CiliumSecretExists(client clientset.Interface) (bool, error) {
 }
 
 func CreateOrUpdateCiliumConfigMap(client clientset.Interface) error {
-	etcdEndpoints := []string{}
-	apiEndpoints, err := kubeadm.GetAPIEndpointsFromConfigMap(client)
-	if err != nil {
-		return errors.Wrap(err, "unable to get api endpoints")
-	}
-	for _, endpoints := range apiEndpoints {
-		etcdEndpoints = append(etcdEndpoints, fmt.Sprintf(etcdEndpointFmt, endpoints))
-	}
-	etcdConfigData := EtcdConfig{
-		Endpoints: etcdEndpoints,
-		CAFile:    etcdCAFileName,
-		CertFile:  etcdCertFileName,
-		KeyFile:   etcdKeyFileName,
-	}
-
-	etcdConfigDataByte, err := yaml.Marshal(&etcdConfigData)
-	if err != nil {
-		return err
-	}
 	ciliumConfigMapData := map[string]string{
-		"debug":       "false",
-		"enable-ipv4": "true",
-		"enable-ipv6": "false",
-		"etcd-config": string(etcdConfigDataByte),
+		"bpf-ct-global-tcp-max":    "524288",
+		"bpf-ct-global-any-max":    "262144",
+		"debug":                    "false",
+		"enable-ipv4":              "true",
+		"enable-ipv6":              "false",
+		"identity-allocation-mode": "crd",
+		"preallocate-bpf-maps":     "false",
 	}
 	ciliumConfigMap := &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
