@@ -25,6 +25,7 @@ import (
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
@@ -104,32 +105,66 @@ func CiliumSecretExists(client clientset.Interface) (bool, error) {
 	return kubernetes.DoesResourceExistWithError(err)
 }
 
-func CreateOrUpdateCiliumConfigMap(client clientset.Interface) error {
-	etcdEndpoints := []string{}
-	apiEndpoints, err := kubeadm.GetAPIEndpointsFromConfigMap(client)
+// NeedsEtcdToCrdMigration checks if the migration from etcd to CRD is needed,
+// which is the case when upgrading from Cilium 1.5 to Cilium 1.6. Decision
+// depends on the old Cilium ConfigMap. If that config map exists and contains
+// the etcd config, migration has to be done.
+func NeedsEtcdToCrdMigration(client clientset.Interface) (bool, error) {
+	configMap, err := client.CoreV1().ConfigMaps(
+		metav1.NamespaceSystem).Get(
+		ciliumConfigMapName, metav1.GetOptions{})
 	if err != nil {
-		return errors.Wrap(err, "unable to get api endpoints")
+		// If the old config map is not found, etcd config and migration
+		// to CRD are not needed.
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "could not retrieve old cilium configmap, although it exists")
 	}
-	for _, endpoints := range apiEndpoints {
-		etcdEndpoints = append(etcdEndpoints, fmt.Sprintf(etcdEndpointFmt, endpoints))
-	}
-	etcdConfigData := EtcdConfig{
-		Endpoints: etcdEndpoints,
-		CAFile:    etcdCAFileName,
-		CertFile:  etcdCertFileName,
-		KeyFile:   etcdKeyFileName,
+	_, ok := configMap.Data["etcd-config"]
+	return ok, nil
+}
+
+func CreateOrUpdateCiliumConfigMap(client clientset.Interface) error {
+	ciliumConfigMapData := map[string]string{
+		"bpf-ct-global-tcp-max":    "524288",
+		"bpf-ct-global-any-max":    "262144",
+		"debug":                    "false",
+		"enable-ipv4":              "true",
+		"enable-ipv6":              "false",
+		"identity-allocation-mode": "crd",
+		"preallocate-bpf-maps":     "false",
 	}
 
-	etcdConfigDataByte, err := yaml.Marshal(&etcdConfigData)
+	needsEtcdConfig, err := NeedsEtcdToCrdMigration(client)
 	if err != nil {
 		return err
 	}
-	ciliumConfigMapData := map[string]string{
-		"debug":       "false",
-		"enable-ipv4": "true",
-		"enable-ipv6": "false",
-		"etcd-config": string(etcdConfigDataByte),
+	if needsEtcdConfig {
+		etcdEndpoints := []string{}
+		apiEndpoints, err := kubeadm.GetAPIEndpointsFromConfigMap(client)
+		if err != nil {
+			return errors.Wrap(err, "unable to get api endpoints")
+		}
+		for _, endpoints := range apiEndpoints {
+			etcdEndpoints = append(etcdEndpoints, fmt.Sprintf(etcdEndpointFmt, endpoints))
+		}
+		etcdConfigData := EtcdConfig{
+			Endpoints: etcdEndpoints,
+			CAFile:    etcdCAFileName,
+			CertFile:  etcdCertFileName,
+			KeyFile:   etcdKeyFileName,
+		}
+
+		etcdConfigDataByte, err := yaml.Marshal(&etcdConfigData)
+		if err != nil {
+			return err
+		}
+
+		ciliumConfigMapData["etcd-config"] = string(etcdConfigDataByte)
+		ciliumConfigMapData["identity-allocation-mode"] = "kvstore"
 	}
+
 	ciliumConfigMap := &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ciliumConfigMapName,

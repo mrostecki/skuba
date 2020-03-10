@@ -18,7 +18,6 @@
 package cni
 
 import (
-	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -196,7 +195,7 @@ func Test_AnnotateCiliumDaemonsetWithCurrentTimestamp(t *testing.T) {
 }
 
 func Test_CreateOrUpdateCiliumConfigMap(t *testing.T) {
-	cmBase := &corev1.ConfigMap{
+	cmKubeadm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "kubeadm-config",
 			Namespace: metav1.NamespaceSystem,
@@ -211,53 +210,107 @@ apiEndpoints:
 `},
 	}
 
-	cmDefaultNamespace := &corev1.ConfigMap{
+	cmCiliumWithoutEtcd := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "fake",
-			Namespace: metav1.NamespaceDefault,
+			Name:      ciliumConfigMapName,
+			Namespace: metav1.NamespaceSystem,
 		},
 		Data: map[string]string{"hello": "world"},
 	}
+	cmCiliumWithEtcd := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ciliumConfigMapName,
+			Namespace: metav1.NamespaceSystem,
+		},
+		Data: map[string]string{
+			"hello":       "world",
+			"etcd-config": "etcd-config-content",
+		},
+	}
 
 	tests := []struct {
-		clientset          *fake.Clientset
-		configmap          *corev1.ConfigMap
-		debugExpected      string
-		enableIpv4Expected string
-		enableIpv6Expected string
-		etcdConfigExpected string
-		errExpected        bool
-		errMessage         string
-		name               string
+		clientset                      *fake.Clientset
+		kubeadmconfigmap               *corev1.ConfigMap
+		ciliumconfigmap                *corev1.ConfigMap
+		bpfCtGlobalTcpMaxExpected      string
+		bpfCtGlobalAnyMaxExpected      string
+		debugExpected                  string
+		enableIpv4Expected             string
+		enableIpv6Expected             string
+		etcdConfigExpected             string
+		identityAllocationModeExpected string
+		preallocateBpfMapsExpected     string
+		errExpected                    bool
+		errMessage                     string
+		name                           string
 	}{
 		{
-			name:               "should create or update cilium configmap",
-			clientset:          fake.NewSimpleClientset(),
-			configmap:          cmBase,
-			debugExpected:      "false",
-			enableIpv4Expected: "true",
-			enableIpv6Expected: "false",
-			errExpected:        false,
+			name:                           "should create cilium configmap",
+			clientset:                      fake.NewSimpleClientset(),
+			bpfCtGlobalTcpMaxExpected:      "524288",
+			bpfCtGlobalAnyMaxExpected:      "262144",
+			debugExpected:                  "false",
+			enableIpv4Expected:             "true",
+			enableIpv6Expected:             "false",
+			etcdConfigExpected:             "",
+			identityAllocationModeExpected: "crd",
+			preallocateBpfMapsExpected:     "false",
+			errExpected:                    false,
+		},
+		{
+			name:                           "should update configmap, should not contain etcd info (old configmap comes from cilium >=1.6)",
+			clientset:                      fake.NewSimpleClientset(),
+			ciliumconfigmap:                cmCiliumWithoutEtcd,
+			bpfCtGlobalTcpMaxExpected:      "524288",
+			bpfCtGlobalAnyMaxExpected:      "262144",
+			debugExpected:                  "false",
+			enableIpv4Expected:             "true",
+			enableIpv6Expected:             "false",
+			etcdConfigExpected:             "",
+			identityAllocationModeExpected: "crd",
+			preallocateBpfMapsExpected:     "false",
+			errExpected:                    false,
+		},
+		{
+			name:                      "should update configmap, should contain etcd info (old configmap comes from cilium <1.6)",
+			clientset:                 fake.NewSimpleClientset(),
+			kubeadmconfigmap:          cmKubeadm,
+			ciliumconfigmap:           cmCiliumWithEtcd,
+			bpfCtGlobalTcpMaxExpected: "524288",
+			bpfCtGlobalAnyMaxExpected: "262144",
+			debugExpected:             "false",
+			enableIpv4Expected:        "true",
+			enableIpv6Expected:        "false",
 			etcdConfigExpected: `ca-file: /tmp/cilium-etcd/ca.crt
 cert-file: /tmp/cilium-etcd/tls.crt
 endpoints:
 - https://1.2.3.4:2379
 key-file: /tmp/cilium-etcd/tls.key
-`},
+`,
+			identityAllocationModeExpected: "kvstore",
+			preallocateBpfMapsExpected:     "false",
+			errExpected:                    false,
+		},
 		{
-			name:        "should fail when kubeadm-config configmap not exist",
-			clientset:   fake.NewSimpleClientset(),
-			configmap:   cmDefaultNamespace,
-			errExpected: true,
-			errMessage:  "unable to get api endpoints: could not retrieve the kubeadm-config configmap to get apiEndpoints: configmaps \"kubeadm-config\" not found",
+			name:            "should fail, etcd info requested, but kubeadm-config config map does not exist",
+			clientset:       fake.NewSimpleClientset(),
+			ciliumconfigmap: cmCiliumWithEtcd,
+			errExpected:     true,
+			errMessage:      "unable to get api endpoints: could not retrieve the kubeadm-config configmap to get apiEndpoints: configmaps \"kubeadm-config\" not found",
 		},
 	}
 
 	for _, tt := range tests {
 		tt := tt // Parallel testing
 		t.Run(tt.name, func(t *testing.T) {
-			//nolint:errcheck
-			tt.clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Create(tt.configmap)
+			if tt.kubeadmconfigmap != nil {
+				//nolint:errcheck
+				tt.clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Create(tt.kubeadmconfigmap)
+			}
+			if tt.ciliumconfigmap != nil {
+				//nolint:errcheck
+				tt.clientset.CoreV1().ConfigMaps(metav1.NamespaceSystem).Create(tt.ciliumconfigmap)
+			}
 
 			err := CreateOrUpdateCiliumConfigMap(tt.clientset)
 
@@ -283,14 +336,22 @@ key-file: /tmp/cilium-etcd/tls.key
 				}
 
 				dataExpected := map[string]string{
-					"debug":       tt.debugExpected,
-					"enable-ipv4": tt.enableIpv4Expected,
-					"enable-ipv6": tt.enableIpv6Expected,
-					"etcd-config": tt.etcdConfigExpected,
+					"bpf-ct-global-tcp-max":    tt.bpfCtGlobalTcpMaxExpected,
+					"bpf-ct-global-any-max":    tt.bpfCtGlobalAnyMaxExpected,
+					"debug":                    tt.debugExpected,
+					"enable-ipv4":              tt.enableIpv4Expected,
+					"enable-ipv6":              tt.enableIpv6Expected,
+					"identity-allocation-mode": tt.identityAllocationModeExpected,
+					"preallocate-bpf-maps":     tt.preallocateBpfMapsExpected,
 				}
-				if !reflect.DeepEqual(dataGet.Data, dataExpected) {
-					t.Errorf("returned data (%v) does not match the expected one (%v)", dataGet.Data, dataExpected)
-					return
+				if tt.etcdConfigExpected != "" {
+					dataExpected["etcd-config"] = tt.etcdConfigExpected
+				}
+				for k, expected := range dataExpected {
+					returned := dataGet.Data[k]
+					if returned != expected {
+						t.Errorf("returned data (%v) does not match the expected one (%v)", returned, expected)
+					}
 				}
 			}
 		})
