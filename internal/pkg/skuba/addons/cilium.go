@@ -23,6 +23,7 @@ import (
 	"github.com/SUSE/skuba/internal/pkg/skuba/skuba"
 	skubaconstants "github.com/SUSE/skuba/pkg/skuba"
 	"github.com/pkg/errors"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
 )
 
@@ -74,6 +75,26 @@ func (ciliumCallbacks) beforeApply(addonConfiguration AddonConfiguration, skubaC
 }
 
 func (ciliumCallbacks) afterApply(addonConfiguration AddonConfiguration, skubaConfiguration *skuba.SkubaConfiguration) error {
+	client, config, err := kubernetes.GetAdminClientSetWithConfig()
+	if err != nil {
+		return errors.Wrap(err, "unable to get admin client set")
+	}
+	needsMigration, err := cni.NeedsEtcdToCrdMigration(client)
+	if err != nil {
+		return err
+	}
+	if !needsMigration {
+		return nil
+	}
+	if err := cni.MigrateEtcdToCrd(client, config); err != nil {
+		klog.Warningf("could not perform migration of cilium data from etcd to CRD, the upgrade will be continued without it, which will result in temporary connection loss for currently existing pods and services: %s", err)
+	}
+	if err := cni.RemoveEtcdConfig(client); err != nil {
+		return err
+	}
+	if err := cni.RestartCiliumDs(); err != nil {
+		return err
+	}
 	return nil
 }
 

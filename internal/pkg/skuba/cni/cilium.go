@@ -18,9 +18,13 @@
 package cni
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/x509"
 	"fmt"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -28,10 +32,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
+	"k8s.io/kubectl/pkg/scheme"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
@@ -39,6 +48,7 @@ import (
 
 	"github.com/SUSE/skuba/internal/pkg/skuba/kubeadm"
 	"github.com/SUSE/skuba/internal/pkg/skuba/kubernetes"
+	skubaconstants "github.com/SUSE/skuba/pkg/skuba"
 )
 
 const (
@@ -57,7 +67,13 @@ var (
 		Organization: []string{kubeadmconstants.SystemPrivilegedGroup},
 		Usages:       []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
-	etcdDir = filepath.Join("pki", "etcd")
+	etcdDir        = filepath.Join("pki", "etcd")
+	migrationRetry = wait.Backoff{
+		Steps:    20,
+		Duration: 5 * time.Second,
+		Factor:   1.0,
+		Jitter:   0.1,
+	}
 )
 
 type EtcdConfig struct {
@@ -108,7 +124,9 @@ func CiliumSecretExists(client clientset.Interface) (bool, error) {
 // NeedsEtcdToCrdMigration checks if the migration from etcd to CRD is needed,
 // which is the case when upgrading from Cilium 1.5 to Cilium 1.6. Decision
 // depends on the old Cilium ConfigMap. If that config map exists and contains
-// the etcd config, migration has to be done.
+// the etcd config, migration has to be done. If not, it means that we have a
+// fresh deployment of Cilium 1.6 configured to use CRD and no migration is
+// needed.
 func NeedsEtcdToCrdMigration(client clientset.Interface) (bool, error) {
 	configMap, err := client.CoreV1().ConfigMaps(
 		metav1.NamespaceSystem).Get(
@@ -177,6 +195,113 @@ func CreateOrUpdateCiliumConfigMap(client clientset.Interface) error {
 		return errors.Wrap(err, "error when creating cilium config ")
 	}
 
+	return nil
+}
+
+// MigrateEtcdToCrd performs the migration of Cilium internal data from etcd
+// cluster to CRD during upgrade from Cilium 1.5 to Cilium 1.6. This step is not
+// mandatory, without it, Cilium is going to regenerate data from scratch which
+// might result in service downtimes. If the automated migration is not
+// successful, the upgrade will be continued without migration and user will be
+// warned about downtime of services.
+func MigrateEtcdToCrd(client clientset.Interface, config *rest.Config) error {
+	var ciliumPod string
+
+	klog.Info("starting migration from etcd to CRD as a data store for cilium")
+
+	// Find any Cilium pod.
+	if err := retry.OnError(migrationRetry, IsErrCiliumNotFound, func() error {
+		pods, err := client.CoreV1().Pods(metav1.NamespaceSystem).List(metav1.ListOptions{
+			LabelSelector: "k8s-app=cilium",
+		})
+		if err != nil {
+			return errors.Wrap(err, "could not find cilium pods")
+		}
+		if len(pods.Items) < 1 {
+			return ErrCiliumNotFound
+		}
+		ciliumPod = pods.Items[0].GetName()
+		// Wait until the Cilium pod is not in the pending status and
+		// check whether it's running.
+		klog.Infof("waiting for availability of cilium pod %s", ciliumPod)
+		var pod *v1.Pod
+		for {
+			var err error
+			pod, err = client.CoreV1().Pods(metav1.NamespaceSystem).Get(ciliumPod, metav1.GetOptions{})
+			if err != nil {
+				return errors.Wrapf(ErrCiliumNotFound, "could not get cilium pod: %v", err)
+			}
+			if pod.Status.Phase != v1.PodPending {
+				break
+			}
+		}
+		if pod.Status.Phase != v1.PodRunning {
+			return ErrCiliumPodUnsuccessful
+		}
+		if !strings.Contains(pod.Spec.Containers[0].Image, ":1.6") {
+			return ErrCiliumNotFound
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Perform the migration.
+	req := client.CoreV1().RESTClient().Post().Resource("pods").Name(ciliumPod).
+		Namespace(metav1.NamespaceSystem).SubResource("exec")
+	option := &v1.PodExecOptions{
+		Command: []string{"cilium", "preflight", "migrate-identity"},
+		Stdin:   false,
+		Stdout:  true,
+		Stderr:  true,
+		TTY:     true,
+	}
+	req.VersionedParams(
+		option,
+		scheme.ParameterCodec,
+	)
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return err
+	}
+	var stdout, stderr bytes.Buffer
+	bStdout := bufio.NewWriter(&stdout)
+	bStderr := bufio.NewWriter(&stderr)
+	err = exec.Stream(remotecommand.StreamOptions{
+		Stdout: bStdout,
+		Stderr: bStderr,
+	})
+	bStdout.Flush()
+	bStderr.Flush()
+	if err != nil {
+		return errors.Errorf("could not migrate data from etcd to CRD: %v; stdout: %v; stderr: %v",
+			err, stdout.String(), stderr.String())
+	}
+
+	klog.Info("successfully migrated from etcd to CRD")
+
+	return nil
+}
+
+func RemoveEtcdConfig(client clientset.Interface) error {
+	cm, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ciliumConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(err, "could not get cilium config map")
+	}
+	delete(cm.Data, "etcd-config")
+	if _, err := client.CoreV1().ConfigMaps(metav1.NamespaceSystem).Update(cm); err != nil {
+		return errors.Wrap(err, "could not update cilium config map")
+	}
+	return nil
+}
+
+func RestartCiliumDs() error {
+	cmd := exec.Command("kubectl", "-n", "kube-system", "rollout", "--kubeconfig", skubaconstants.KubeConfigAdminFile(), "restart", "ds/cilium")
+	if combinedOutput, err := cmd.CombinedOutput(); err != nil {
+		klog.Errorf("failed to restart cilium daemonset: %s", combinedOutput)
+		return err
+	}
 	return nil
 }
 
