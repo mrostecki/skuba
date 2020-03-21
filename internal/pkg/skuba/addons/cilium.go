@@ -18,11 +18,22 @@
 package addons
 
 import (
+	"bufio"
+	"bytes"
+	"strings"
+
 	"github.com/SUSE/skuba/internal/pkg/skuba/cni"
 	"github.com/SUSE/skuba/internal/pkg/skuba/kubernetes"
 	"github.com/SUSE/skuba/internal/pkg/skuba/skuba"
 	skubaconstants "github.com/SUSE/skuba/pkg/skuba"
 	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/kubernetes/cmd/kubeadm/app/images"
 )
 
@@ -73,8 +84,100 @@ func (ciliumCallbacks) beforeApply(addonConfiguration AddonConfiguration, skubaC
 	return nil
 }
 
-func (ciliumCallbacks) afterApply(addonConfiguration AddonConfiguration, skubaConfiguration *skuba.SkubaConfiguration) error {
+// migrateEtcdToCrd performs the migration of Cilium internal data from etcd
+// cluster to CRD during upgrade from Cilium 1.5 to Cilium 1.6. This step is not
+// mandatory, without it, Cilium is going to regenerate data from scratch which
+// might result in service downtimes. If the automated migration is not
+// successful, the upgrade should still proceed with the risk of temporary
+// service downtimes.
+func migrateEtcdToCrd(client clientset.Interface, config *rest.Config) error {
+	// Find any Cilium pod.
+	var ciliumPod string
+	if err := retry.OnError(retry.DefaultRetry, IsErrCiliumNotFound, func() error {
+		pods, err := client.CoreV1().Pods(metav1.NamespaceSystem).List(metav1.ListOptions{})
+		if err != nil {
+			return err
+		}
+		for _, pod := range pods.Items {
+			podName := pod.GetName()
+			if strings.HasPrefix(podName, "cilium") {
+				ciliumPod = podName
+				break
+			}
+		}
+		if ciliumPod == "" {
+			return ErrCiliumNotFound
+		}
+		// Wait until the Cilium pod is not in the pending status and
+		// check whether status is successful.
+		var pod *v1.Pod
+		for {
+			var err error
+			pod, err = client.CoreV1().Pods(metav1.NamespaceSystem).Get(ciliumPod, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if pod.Status.Phase != v1.PodPending {
+				break
+			}
+		}
+		if pod.Status.Phase != v1.PodSucceeded {
+			return ErrCiliumPodUnsuccessful
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Perform the migration.
+	req := client.CoreV1().RESTClient().Post().Resource("pods").Name(ciliumPod).
+		Namespace(metav1.NamespaceSystem).SubResource("exec")
+	option := &v1.PodExecOptions{
+		Command: []string{"cilium", "preflight", "migrate-identity"},
+		Stdin:   false,
+		Stdout:  true,
+		Stderr:  true,
+		TTY:     true,
+	}
+	req.VersionedParams(
+		option,
+		scheme.ParameterCodec,
+	)
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return err
+	}
+	var stdout, stderr bytes.Buffer
+	bStdout := bufio.NewWriter(&stdout)
+	bStderr := bufio.NewWriter(&stderr)
+	err = exec.Stream(remotecommand.StreamOptions{
+		Stdout: bStdout,
+		Stderr: bStderr,
+	})
+	bStdout.Flush()
+	bStderr.Flush()
+	if err != nil {
+		return errors.Errorf("could not migrate data from etcd to CRD: %v; stdout: %v; stderr: %v",
+			err, stdout.String(), stderr.String())
+	}
+
 	return nil
+}
+
+func (ciliumCallbacks) afterApply(addonConfiguration AddonConfiguration, skubaConfiguration *skuba.SkubaConfiguration) error {
+	client, config, err := kubernetes.GetAdminClientSetWithConfig()
+	if err != nil {
+		return errors.Wrap(err, "unable to get admin client set")
+	}
+	needsMigration, err := cni.NeedsEtcdToCrdMigration(client)
+	if err != nil {
+		return err
+	}
+	if !needsMigration {
+		return nil
+	}
+
+	return migrateEtcdToCrd(client, config)
 }
 
 const (
