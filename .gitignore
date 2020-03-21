@@ -30,3 +30,6 @@ ci/packaging/suse/obs_files
 
 # ignore junit files
 ci/infra/testrunner/pr.xml
+
+# Backup files
+*~
